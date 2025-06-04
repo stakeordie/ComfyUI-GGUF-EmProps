@@ -118,10 +118,12 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 class UnetLoaderGGUF:
     @classmethod
     def INPUT_TYPES(s):
-        unet_names = [x for x in folder_paths.get_filename_list("unet_gguf")]
         return {
             "required": {
-                "unet_name": (unet_names,),
+                "unet_name": ("STRING", {"multiline": False, "default": ""}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
             }
         }
 
@@ -130,7 +132,11 @@ class UnetLoaderGGUF:
     CATEGORY = "bootleg"
     TITLE = "Unet Loader (GGUF)"
 
-    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
+    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None, node_id=None):
+        import os
+        import time
+        
+        # Flag: 2025-06-04 16:55 - Added retry logic for model loading
         ops = GGMLOps()
 
         if dequant_dtype in ("default", None):
@@ -146,9 +152,38 @@ class UnetLoaderGGUF:
             ops.Linear.patch_dtype = patch_dtype
         else:
             ops.Linear.patch_dtype = getattr(torch, patch_dtype)
-
-        # init model
-        unet_path = folder_paths.get_full_path("unet", unet_name)
+            
+        # Force refresh the cache to ensure we see the latest files
+        if "unet_gguf" in folder_paths.filename_list_cache:
+            del folder_paths.filename_list_cache["unet_gguf"]
+        
+        # Try to find and load the model with retries
+        max_attempts = 5
+        attempt = 0
+        unet_path = None
+        
+        while attempt < max_attempts:
+            try:
+                unet_path = folder_paths.get_full_path("unet_gguf", unet_name)
+                if unet_path and os.path.exists(unet_path):
+                    break
+            except Exception as e:
+                pass
+                
+            # If not found, wait a bit and try again (in case it's still being written)
+            time.sleep(1)
+            
+            # Refresh the cache again
+            if "unet_gguf" in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache["unet_gguf"]
+            folder_paths.get_filename_list("unet_gguf")
+            
+            attempt += 1
+        
+        if not unet_path or not os.path.exists(unet_path):
+            raise ValueError(f"GGUF model {unet_name} not found after {max_attempts} attempts")
+        
+        # Load the model
         sd = gguf_sd_loader(unet_path)
         model = comfy.sd.load_diffusion_model_state_dict(
             sd, model_options={"custom_operations": ops}
@@ -163,13 +198,15 @@ class UnetLoaderGGUF:
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
-        unet_names = [x for x in folder_paths.get_filename_list("unet_gguf")]
         return {
             "required": {
-                "unet_name": (unet_names,),
+                "unet_name": ("STRING", {"multiline": False, "default": ""}),
                 "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_on_device": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
             }
         }
     TITLE = "Unet Loader (GGUF/Advanced)"
@@ -180,8 +217,11 @@ class CLIPLoaderGGUF:
         base = nodes.CLIPLoader.INPUT_TYPES()
         return {
             "required": {
-                "clip_name": (s.get_filename_list(),),
+                "clip_name": ("STRING", {"multiline": False, "default": ""}),
                 "type": base["required"]["type"],
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
             }
         }
 
@@ -222,8 +262,51 @@ class CLIPLoaderGGUF:
         clip.patcher = GGUFModelPatcher.clone(clip.patcher)
         return clip
 
-    def load_clip(self, clip_name, type="stable_diffusion"):
-        clip_path = folder_paths.get_full_path("clip", clip_name)
+    def load_clip(self, clip_name, type="stable_diffusion", node_id=None):
+        import os
+        import time
+        
+        # Flag: 2025-06-04 16:58 - Added retry logic for model loading
+        
+        # Force refresh the cache to ensure we see the latest files
+        if "clip_gguf" in folder_paths.filename_list_cache:
+            del folder_paths.filename_list_cache["clip_gguf"]
+        
+        # Try to find and load the model with retries
+        max_attempts = 5
+        attempt = 0
+        clip_path = None
+        
+        while attempt < max_attempts:
+            try:
+                clip_path = folder_paths.get_full_path("clip_gguf", clip_name)
+                if clip_path and os.path.exists(clip_path):
+                    break
+                    
+                # Try regular clip folder if not found in clip_gguf
+                clip_path = folder_paths.get_full_path("clip", clip_name)
+                if clip_path and os.path.exists(clip_path):
+                    break
+            except Exception as e:
+                pass
+                
+            # If not found, wait a bit and try again (in case it's still being written)
+            time.sleep(1)
+            
+            # Refresh the cache again
+            if "clip_gguf" in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache["clip_gguf"]
+            if "clip" in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache["clip"]
+                
+            folder_paths.get_filename_list("clip_gguf")
+            folder_paths.get_filename_list("clip")
+            
+            attempt += 1
+        
+        if not clip_path or not os.path.exists(clip_path):
+            raise ValueError(f"CLIP model {clip_name} not found after {max_attempts} attempts")
+            
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
 
@@ -231,20 +314,62 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
         base = nodes.DualCLIPLoader.INPUT_TYPES()
-        file_options = (s.get_filename_list(), )
         return {
             "required": {
-                "clip_name1": file_options,
-                "clip_name2": file_options,
+                "clip_name1": ("STRING", {"multiline": False, "default": ""}),
+                "clip_name2": ("STRING", {"multiline": False, "default": ""}),
                 "type": base["required"]["type"],
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
             }
         }
 
     TITLE = "DualCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, type):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
+    def load_clip(self, clip_name1, clip_name2, type, node_id=None):
+        import os
+        import time
+        
+        # Flag: 2025-06-04 17:00 - Added retry logic for model loading
+        
+        # Force refresh the cache
+        for cache_key in ["clip_gguf", "clip"]:
+            if cache_key in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache[cache_key]
+        
+        # Helper function to find clip path with retries
+        def find_clip_path(name, max_attempts=5):
+            for attempt in range(max_attempts):
+                try:
+                    # Try clip_gguf folder first
+                    path = folder_paths.get_full_path("clip_gguf", name)
+                    if path and os.path.exists(path):
+                        return path
+                        
+                    # Try regular clip folder if not found in clip_gguf
+                    path = folder_paths.get_full_path("clip", name)
+                    if path and os.path.exists(path):
+                        return path
+                except Exception as e:
+                    pass
+                    
+                # If not found, wait a bit and try again
+                time.sleep(1)
+                
+                # Refresh the cache again
+                for cache_key in ["clip_gguf", "clip"]:
+                    if cache_key in folder_paths.filename_list_cache:
+                        del folder_paths.filename_list_cache[cache_key]
+                    folder_paths.get_filename_list(cache_key)
+            
+            # If we get here, we couldn't find the file
+            raise ValueError(f"CLIP model {name} not found after {max_attempts} attempts")
+        
+        # Find paths for both models
+        clip_path1 = find_clip_path(clip_name1)
+        clip_path2 = find_clip_path(clip_name2)
+        
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -252,21 +377,63 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
-        file_options = (s.get_filename_list(), )
         return {
             "required": {
-                "clip_name1": file_options,
-                "clip_name2": file_options,
-                "clip_name3": file_options,
+                "clip_name1": ("STRING", {"multiline": False, "default": ""}),
+                "clip_name2": ("STRING", {"multiline": False, "default": ""}),
+                "clip_name3": ("STRING", {"multiline": False, "default": ""}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
             }
         }
 
     TITLE = "TripleCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
+    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3", node_id=None):
+        import os
+        import time
+        
+        # Flag: 2025-06-04 17:00 - Added retry logic for model loading
+        
+        # Force refresh the cache
+        for cache_key in ["clip_gguf", "clip"]:
+            if cache_key in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache[cache_key]
+        
+        # Helper function to find clip path with retries
+        def find_clip_path(name, max_attempts=5):
+            for attempt in range(max_attempts):
+                try:
+                    # Try clip_gguf folder first
+                    path = folder_paths.get_full_path("clip_gguf", name)
+                    if path and os.path.exists(path):
+                        return path
+                        
+                    # Try regular clip folder if not found in clip_gguf
+                    path = folder_paths.get_full_path("clip", name)
+                    if path and os.path.exists(path):
+                        return path
+                except Exception as e:
+                    pass
+                    
+                # If not found, wait a bit and try again
+                time.sleep(1)
+                
+                # Refresh the cache again
+                for cache_key in ["clip_gguf", "clip"]:
+                    if cache_key in folder_paths.filename_list_cache:
+                        del folder_paths.filename_list_cache[cache_key]
+                    folder_paths.get_filename_list(cache_key)
+            
+            # If we get here, we couldn't find the file
+            raise ValueError(f"CLIP model {name} not found after {max_attempts} attempts")
+        
+        # Find paths for all models
+        clip_path1 = find_clip_path(clip_name1)
+        clip_path2 = find_clip_path(clip_name2)
+        clip_path3 = find_clip_path(clip_name3)
+        
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
@@ -274,23 +441,65 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
 class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
-        file_options = (s.get_filename_list(), )
         return {
             "required": {
-            "clip_name1": file_options,
-            "clip_name2": file_options,
-            "clip_name3": file_options,
-            "clip_name4": file_options,
+            "clip_name1": ("STRING", {"multiline": False, "default": ""}),
+            "clip_name2": ("STRING", {"multiline": False, "default": ""}),
+            "clip_name3": ("STRING", {"multiline": False, "default": ""}),
+            "clip_name4": ("STRING", {"multiline": False, "default": ""}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
+            }
         }
-    }
 
     TITLE = "QuadrupleCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
-        clip_path1 = folder_paths.get_full_path("clip", clip_name1)
-        clip_path2 = folder_paths.get_full_path("clip", clip_name2)
-        clip_path3 = folder_paths.get_full_path("clip", clip_name3)
-        clip_path4 = folder_paths.get_full_path("clip", clip_name4)
+    def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion", node_id=None):
+        import os
+        import time
+        
+        # Flag: 2025-06-04 17:00 - Added retry logic for model loading
+        
+        # Force refresh the cache
+        for cache_key in ["clip_gguf", "clip"]:
+            if cache_key in folder_paths.filename_list_cache:
+                del folder_paths.filename_list_cache[cache_key]
+        
+        # Helper function to find clip path with retries
+        def find_clip_path(name, max_attempts=5):
+            for attempt in range(max_attempts):
+                try:
+                    # Try clip_gguf folder first
+                    path = folder_paths.get_full_path("clip_gguf", name)
+                    if path and os.path.exists(path):
+                        return path
+                        
+                    # Try regular clip folder if not found in clip_gguf
+                    path = folder_paths.get_full_path("clip", name)
+                    if path and os.path.exists(path):
+                        return path
+                except Exception as e:
+                    pass
+                    
+                # If not found, wait a bit and try again
+                time.sleep(1)
+                
+                # Refresh the cache again
+                for cache_key in ["clip_gguf", "clip"]:
+                    if cache_key in folder_paths.filename_list_cache:
+                        del folder_paths.filename_list_cache[cache_key]
+                    folder_paths.get_filename_list(cache_key)
+            
+            # If we get here, we couldn't find the file
+            raise ValueError(f"CLIP model {name} not found after {max_attempts} attempts")
+        
+        # Find paths for all models
+        clip_path1 = find_clip_path(clip_name1)
+        clip_path2 = find_clip_path(clip_name2)
+        clip_path3 = find_clip_path(clip_name3)
+        clip_path4 = find_clip_path(clip_name4)
+        
         clip_paths = (clip_path1, clip_path2, clip_path3, clip_path4)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
